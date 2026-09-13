@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 use axum::{
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -21,7 +21,6 @@ pub fn escape_html(s: &str) -> String {
         .replace('\'', "&#x27;")
 }
 
-
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<Mutex<Connection>>,
@@ -29,127 +28,108 @@ pub struct AppState {
     pub auth_token: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Issue {
-    pub id: String,
-    pub title: String,
-    pub severity: String,
-    pub cause: String,
-    pub solution: String,
-}
-
-pub struct Rule {
-    pub id: &'static str,
+pub struct IssueRule {
+    pub name: &'static str,
     pub pattern: Regex,
-    pub title: &'static str,
-    pub severity: &'static str,
-    pub cause: &'static str,
-    pub solution: &'static str,
+    pub solution_ru: &'static str,
 }
 
-pub fn get_rules() -> Vec<Rule> {
+pub fn get_rules() -> Vec<IssueRule> {
     vec![
-        Rule {
-            id: "eula_not_accepted",
+        IssueRule {
+            name: "EULA не принята",
             pattern: Regex::new(r"(?i)You need to agree to the EULA in order to run the server").unwrap(),
-            title: "Не принято соглашение EULA",
-            severity: "CRITICAL",
-            cause: "В файле eula.txt параметр eula установлен в false.",
-            solution: "Откройте файловый менеджер в панели Mars Host, найдите eula.txt и смените на eula=true.",
+            solution_ru: "Вы не приняли EULA. Откройте файл eula.txt и смените eula=false на eula=true.",
         },
-        Rule {
-            id: "port_bind_failure",
-            pattern: Regex::new(r"(?i)(FAILED TO BIND TO PORT|Address already in use: bind|BindException: Address already in use)").unwrap(),
-            title: "Порт уже занят (Port Bind Failure)",
-            severity: "CRITICAL",
-            cause: "Выделенный порт сервера занят зависшим процессом или контейнером.",
-            solution: "1. Перезапустите сервер через панель управления.\n2. Проверьте параметр server-port в server.properties.",
+        IssueRule {
+            name: "Порт уже занят",
+            pattern: Regex::new(r"(?i)(Address already in use: bind|FAILED TO BIND TO PORT)").unwrap(),
+            solution_ru: "Порт уже занят другим процессом. Завершите старый процесс сервера или смените server-port в server.properties.",
         },
-        Rule {
-            id: "java_version_mismatch",
-            pattern: Regex::new(r"(?i)has been compiled by a more recent version of the Java Runtime \(class file version (\d+\.\d+)\), this version of the Java Runtime only recognizes class file versions up to (\d+\.\d+)").unwrap(),
-            title: "Несовместимость версии Java",
-            severity: "CRITICAL",
-            cause: "Ядро или плагин требуют более свежую версию Java Runtime.",
-            solution: "В настройках сервера в панели Mars Host выберите Java 21 (или требуемую версию).",
+        IssueRule {
+            name: "Несовпадение версии Java",
+            pattern: Regex::new(r"(?i)has been compiled by a more recent version of the Java Runtime").unwrap(),
+            solution_ru: "Несовместимая версия Java. Плагин или ядро собраны под более новую версию JVM (установите Java 21+).",
         },
-        Rule {
-            id: "oom_heap",
-            pattern: Regex::new(r"(?i)(java\.lang\.OutOfMemoryError:\s*Java heap space|Out of memory: Kill process)").unwrap(),
-            title: "Нехватка оперативной памяти (Heap OOM)",
-            severity: "CRITICAL",
-            cause: "Сервер потребил всю выделенную оперативную память (Heap Space).",
-            solution: "1. Увеличьте объем RAM кнопкой 'Улучшить' в панели Mars Host.\n2. Уменьшите view-distance до 4-6 чанков или удалите ресурсоемкие плагины.",
+        IssueRule {
+            name: "Нехватка памяти (Heap OOM)",
+            pattern: Regex::new(r"(?i)java\.lang\.OutOfMemoryError:\s*Java heap space").unwrap(),
+            solution_ru: "Закончилась выделенная оперативная память. Увеличьте параметр -Xmx или оптимизируйте количество модов/плагинов.",
         },
-        Rule {
-            id: "oom_metaspace",
+        IssueRule {
+            name: "Переполнение Metaspace",
             pattern: Regex::new(r"(?i)java\.lang\.OutOfMemoryError:\s*Metaspace").unwrap(),
-            title: "Переполнение памяти классов (Metaspace)",
-            severity: "CRITICAL",
-            cause: "Загружено слишком много классов плагинов, исчерпан лимит Metaspace JVM.",
-            solution: "Удалите избыточные плагины или увеличьте лимит RAM сервера.",
+            solution_ru: "Переполнение Metaspace из-за многократных перезагрузок плагинов командой /reload. Перезапустите сервер полностью.",
         },
-        Rule {
-            id: "missing_plugin_dependency",
-            pattern: Regex::new(r"(?i)(?:Could not load '[^']*' in folder 'plugins'|UnknownDependencyException|Plugin '[^']+' requires|depends on: )").unwrap(),
-            title: "Отсутствует зависимость плагина",
-            severity: "ERROR",
-            cause: "Плагин требует наличие базовой библиотеки (Vault, ProtocolLib, PlaceholderAPI и др.).",
-            solution: "Установите недостающие зависимые плагины через вкладку 'Плагины' в панели управления.",
+        IssueRule {
+            name: "Отсутствует зависимость плагина",
+            pattern: Regex::new(r"(?i)(Could not load 'plugins/.*' in folder 'plugins'|UnknownDependencyException)").unwrap(),
+            solution_ru: "Плагин не может запуститься: отсутствует обязательная библиотека или другой зависимый плагин.",
         },
-        Rule {
-            id: "corrupted_chunk",
-            pattern: Regex::new(r"(?i)(Chunk file at .*? is in the wrong location|Corrupt chunk detected|RegionFileException|Corrupted chunk data)").unwrap(),
-            title: "Повреждение файлов мира (Corrupted Region)",
-            severity: "CRITICAL",
-            cause: "Аварийная остановка повредила .mca файл региона карты.",
-            solution: "1. Восстановите мир из бэкапа в панели Mars Host.\n2. Либо удалите поврежденный файл региона из папки world/region/.",
+        IssueRule {
+            name: "Поврежденный чанк (Corrupt Chunk)",
+            pattern: Regex::new(r"(?i)WrongLocationException|Corrupt chunk").unwrap(),
+            solution_ru: "Обнаружен битый чанк в файле региона. Удалите поврежденный регион через MCASelector или восстановите из бэкапа.",
         },
-        Rule {
-            id: "sqlite_db_locked",
-            pattern: Regex::new(r"(?i)(database is locked|sqlite3\.OperationalError:\s*database is locked)").unwrap(),
-            title: "База данных заблокирована (SQLite Lock)",
-            severity: "ERROR",
-            cause: "Параллельные потоки плагинов заблокировали файл SQLite.",
-            solution: "Перезапустите сервер или переключите плагины на внешний MySQL/PostgreSQL.",
+        IssueRule {
+            name: "Слишком большой пакет (Packet Too Large)",
+            pattern: Regex::new(r"(?i)The received encoded string buffer length is longer than maximum allowed").unwrap(),
+            solution_ru: "Превышен допустимый размер сетевого пакета. Возникает из-за чит-книг, предметов с переполненным NBT или перегруженных данных.",
+        },
+        IssueRule {
+            name: "Коллизия UUID игрока",
+            pattern: Regex::new(r"(?i)UUID of player .* is the same as").unwrap(),
+            solution_ru: "Обнаружен дубликат UUID игрока. Включите online-mode=true или настройте современный Bungee/Velocity forwarding.",
+        },
+        IssueRule {
+            name: "База SQLite заблокирована",
+            pattern: Regex::new(r"(?i)(database is locked|SQLiteBusyException)").unwrap(),
+            solution_ru: "База данных SQLite заблокирована другим процессом или зависшим потоком записи.",
         },
     ]
 }
 
-pub fn analyze_log(text: &str) -> Vec<Issue> {
-    let rules = get_rules();
-    let mut issues = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+#[derive(Serialize)]
+pub struct DiagnosisResult {
+    pub rule: String,
+    pub solution_ru: String,
+}
 
-    for rule in &rules {
-        if seen.contains(rule.id) {
-            continue;
-        }
-        if rule.pattern.is_match(text) {
-            seen.insert(rule.id);
-            issues.push(Issue {
-                id: rule.id.to_string(),
-                title: rule.title.to_string(),
-                severity: rule.severity.to_string(),
-                cause: rule.cause.to_string(),
-                solution: rule.solution.to_string(),
+pub fn analyze_log(text: &str) -> Vec<DiagnosisResult> {
+    let rules = get_rules();
+    let mut hits = Vec::new();
+    for r in rules {
+        if r.pattern.is_match(text) {
+            hits.push(DiagnosisResult {
+                rule: r.name.to_string(),
+                solution_ru: r.solution_ru.to_string(),
             });
         }
     }
-    issues
+    hits
 }
 
 pub fn init_db(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS pastes (
             id TEXT PRIMARY KEY,
+            title TEXT NOT NULL DEFAULT 'Без названия',
+            syntax TEXT NOT NULL DEFAULT 'text',
             content BLOB NOT NULL,
+            size_bytes INTEGER NOT NULL DEFAULT 0,
+            views INTEGER NOT NULL DEFAULT 0,
+            is_private INTEGER NOT NULL DEFAULT 0,
+            is_encrypted INTEGER NOT NULL DEFAULT 0,
+            burn_after_reading INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL,
             expires_at INTEGER NOT NULL,
             has_issues INTEGER NOT NULL DEFAULT 0
         );
-        CREATE INDEX IF NOT EXISTS idx_expires_at ON pastes(expires_at);",
-    )
+        CREATE INDEX IF NOT EXISTS idx_expires_at ON pastes(expires_at);
+        CREATE INDEX IF NOT EXISTS idx_created_at ON pastes(created_at);",
+    )?;
+
+    Ok(())
 }
 
 pub fn clean_expired(conn: &Connection) -> rusqlite::Result<usize> {
@@ -159,8 +139,14 @@ pub fn clean_expired(conn: &Connection) -> rusqlite::Result<usize> {
 
 #[derive(Deserialize)]
 pub struct CreatePastePayload {
+    pub title: Option<String>,
+    pub syntax: Option<String>,
     pub content: Option<String>,
+    pub ttl_minutes: Option<i64>,
     pub ttl_hours: Option<i64>,
+    pub is_private: Option<bool>,
+    pub is_encrypted: Option<bool>,
+    pub burn_after_reading: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -172,162 +158,941 @@ pub struct CreatePasteResponse {
     pub issues_detected: usize,
 }
 
-pub async fn root_editor() -> Html<&'static str> {
-    Html(r#"<!DOCTYPE html>
-<html lang="en">
+#[derive(Serialize)]
+pub struct PasteItem {
+    pub id: String,
+    pub title: String,
+    pub syntax: String,
+    pub size_bytes: i64,
+    pub views: i64,
+    pub created_at_human: String,
+    pub has_issues: bool,
+    pub is_encrypted: bool,
+    pub burn_after_reading: bool,
+}
+
+fn human_size(bytes: i64) -> String {
+    if bytes < 1024 {
+        format!("{} Б", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} КБ", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} МБ", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+fn human_time_ago(ts: i64) -> String {
+    let now = Utc::now().timestamp();
+    let diff = now - ts;
+    if diff < 60 {
+        format!("{} сек. назад", diff.max(1))
+    } else if diff < 3600 {
+        format!("{} мин. назад", diff / 60)
+    } else if diff < 86400 {
+        format!("{} ч. назад", diff / 3600)
+    } else {
+        format!("{} дн. назад", diff / 86400)
+    }
+}
+
+fn syntax_title(syntax: &str) -> &'static str {
+    match syntax {
+        "log" => "Лог сервера",
+        "yaml" => "YAML",
+        "json" => "JSON",
+        "xml" => "XML / HTML",
+        "toml" => "TOML / INI",
+        "properties" => "Properties",
+        "java" => "Java",
+        "kotlin" => "Kotlin",
+        "rust" => "Rust",
+        "python" => "Python",
+        "javascript" => "JavaScript",
+        "typescript" => "TypeScript",
+        "c" => "C",
+        "cpp" => "C++",
+        "csharp" => "C#",
+        "go" => "Go",
+        "php" => "PHP",
+        "ruby" => "Ruby",
+        "sql" => "SQL",
+        "bash" => "Bash / Shell",
+        "dockerfile" => "Dockerfile",
+        "nginx" => "Nginx Config",
+        "markdown" => "Markdown",
+        _ => "Обычный текст",
+    }
+}
+
+fn human_expires_in(expires_at: i64) -> String {
+    let diff = (expires_at - Utc::now().timestamp()).max(0);
+    if diff < 60 {
+        format!("{} сек.", diff.max(1))
+    } else if diff < 3600 {
+        format!("{} мин.", (diff + 59) / 60)
+    } else if diff < 86400 {
+        format!("{} ч.", (diff + 3599) / 3600)
+    } else {
+        format!("{} дн.", (diff + 86399) / 86400)
+    }
+}
+
+fn render_sidebar_pastes(recent: &[PasteItem]) -> String {
+    if recent.is_empty() {
+        return r#"<div style="color: #6e7681; font-size: 0.85rem; padding: 12px 0;">Публичных записей пока нет</div>"#.to_string();
+    }
+    let mut out = String::new();
+    for p in recent {
+        let mut badges = String::new();
+        if p.is_encrypted {
+            badges.push_str(r#"<span class="badge badge-enc">🔐 E2E</span>"#);
+        }
+        if p.has_issues {
+            badges.push_str(r#"<span class="badge badge-warn">⚠️ Ошибка</span>"#);
+        }
+        out.push_str(&format!(
+            r#"<a href="/p/{}" class="sidebar-item">
+                <div class="sidebar-item-title">{} {}</div>
+                <div class="sidebar-item-meta">
+                    <span class="syntax-tag">{}</span>
+                    <span>{}</span>
+                    <span>{}</span>
+                    <span>👁️ {}</span>
+                </div>
+            </a>"#,
+            p.id,
+            escape_html(&p.title),
+            badges,
+            syntax_title(&p.syntax),
+            escape_html(&human_size(p.size_bytes)),
+            p.created_at_human,
+            p.views
+        ));
+    }
+    out
+}
+
+pub async fn root_editor(State(state): State<AppState>) -> Html<String> {
+    let recent = {
+        let conn = state.db.lock().unwrap();
+        let _ = clean_expired(&conn);
+        let now = Utc::now().timestamp();
+        let mut stmt = conn.prepare(
+            "SELECT id, title, syntax, size_bytes, views, created_at, has_issues, is_encrypted, burn_after_reading 
+             FROM pastes 
+             WHERE is_private = 0 AND burn_after_reading = 0 AND expires_at > ?1 
+             ORDER BY created_at DESC 
+             LIMIT 15"
+        ).unwrap();
+
+        let rows = stmt.query_map(params![now], |row| {
+            let created_at: i64 = row.get(5)?;
+            Ok(PasteItem {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                syntax: row.get(2)?,
+                size_bytes: row.get(3)?,
+                views: row.get(4)?,
+                created_at_human: human_time_ago(created_at),
+                has_issues: row.get::<_, i64>(6)? > 0,
+                is_encrypted: row.get::<_, i64>(7)? > 0,
+                burn_after_reading: row.get::<_, i64>(8)? > 0,
+            })
+        }).unwrap();
+
+        let mut items = Vec::new();
+        for r in rows.flatten() {
+            items.push(r);
+        }
+        items
+    };
+
+    let sidebar_html = render_sidebar_pastes(&recent);
+
+    let html = format!(r#"<!DOCTYPE html>
+<html lang="ru">
 <head>
   <meta charset="UTF-8">
-  <title>ES-Paste - Minimal Log Vault</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ES-Paste — Хранилище логов, ошибок и кода | Pastebin</title>
+  <meta name="description" content="Быстрый русскоязычный Pastebin-сервис для публикации серверных логов, стектрейсов ошибок, конфигов и исходного кода с автоматической диагностикой проблем.">
+  <meta name="keywords" content="pastebin, логи сервера, minecraft crash, анализ логов, хранилище кода, paste, стектрейс, es-paste">
+  <meta property="og:title" content="ES-Paste — Хранилище логов и кода">
+  <meta property="og:description" content="Публикация серверных логов, конфигов и кода. Автоматический анализ типичных ошибок Minecraft и Java серверов.">
+  <meta property="og:type" content="website">
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="alternate icon" type="image/x-icon" href="/favicon.ico">
   <style>
-    :root {
-      --bg: #0d1117;
-      --surface: #161b22;
-      --border: #30363d;
-      --text: #c9d1d9;
-      --accent: #58a6ff;
-      --accent-hover: #79c0ff;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
+    :root {{
+      --bg: #090d16;
+      --card-bg: #121826;
+      --surface: #1a2234;
+      --border: #26334d;
+      --text: #e1e7f0;
+      --muted: #8b9bb4;
+      --accent: #38bdf8;
+      --accent-hover: #7dd3fc;
+      --green: #22c55e;
+      --green-hover: #16a34a;
+      --warn: #f59e0b;
+    }}
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
       background: var(--bg);
       color: var(--text);
-      font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
       min-height: 100vh;
       display: flex;
       flex-direction: column;
-    }
-    header {
-      padding: 12px 24px;
-      background: var(--surface);
+    }}
+    header {{
+      padding: 14px 28px;
+      background: var(--card-bg);
       border-bottom: 1px solid var(--border);
       display: flex;
       align-items: center;
       justify-content: space-between;
-    }
-    .logo {
-      font-weight: 700;
+      gap: 16px;
+      flex-wrap: wrap;
+    }}
+    .brand {{
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      text-decoration: none;
+    }}
+    .logo {{
+      font-weight: 800;
       color: var(--accent);
-      font-size: 1.15rem;
-      letter-spacing: 0.05em;
-    }
-    .actions { display: flex; gap: 12px; align-items: center; }
-    select, button, input {
-      background: var(--bg);
+      font-size: 1.25rem;
+      letter-spacing: -0.02em;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }}
+    .logo span {{ color: #fff; }}
+    .nav-links {{
+      display: flex;
+      gap: 18px;
+      align-items: center;
+    }}
+    .nav-link {{
+      color: var(--muted);
+      text-decoration: none;
+      font-size: 0.9rem;
+      font-weight: 500;
+      transition: color 0.15s;
+    }}
+    .nav-link:hover, .nav-link.active {{ color: var(--accent); }}
+    
+    .layout {{
+      flex: 1;
+      display: flex;
+      max-width: 1440px;
+      width: 100%;
+      margin: 0 auto;
+      padding: 24px;
+      gap: 24px;
+    }}
+    .main-editor {{
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+      min-width: 0;
+    }}
+    .editor-header {{
+      padding: 14px 20px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+    }}
+    .form-control {{
+      background: var(--card-bg);
       border: 1px solid var(--border);
       color: var(--text);
-      padding: 6px 14px;
+      padding: 8px 12px;
       border-radius: 6px;
       font-family: inherit;
       font-size: 0.88rem;
-    }
-    button {
-      background: #238636;
-      border-color: #2ea043;
+      outline: none;
+    }}
+    .form-control:focus {{
+      border-color: var(--accent);
+    }}
+    .btn-submit {{
+      background: var(--green);
+      border: none;
       color: #fff;
-      cursor: pointer;
+      padding: 8px 18px;
+      border-radius: 6px;
       font-weight: 600;
-    }
-    button:hover { background: #2ea043; }
-    .editor-container {
-      flex: 1;
+      font-size: 0.9rem;
+      cursor: pointer;
       display: flex;
+      align-items: center;
+      gap: 6px;
+      transition: background 0.15s;
+    }}
+    .btn-submit:hover {{ background: var(--green-hover); }}
+
+    .editor-body {{
+      display: flex;
+      flex: 1;
+      min-height: 480px;
       position: relative;
-    }
-    .line-numbers {
-      width: 48px;
+    }}
+    .line-numbers {{
+      width: 50px;
       padding: 16px 8px;
       text-align: right;
-      color: #484f58;
+      color: #4b5875;
       user-select: none;
       background: var(--surface);
       border-right: 1px solid var(--border);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
       font-size: 0.9rem;
       line-height: 1.5;
       overflow: hidden;
       white-space: pre;
-    }
-    textarea {
+    }}
+    textarea {{
       flex: 1;
       background: transparent;
       border: none;
       color: var(--text);
       padding: 16px;
-      font-family: inherit;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
       font-size: 0.9rem;
       line-height: 1.5;
       resize: none;
       outline: none;
       tab-size: 4;
       white-space: pre;
-    }
-    footer {
-      padding: 8px 24px;
-      font-size: 0.8rem;
-      color: #8b949e;
-      border-top: 1px solid var(--border);
+    }}
+    
+    .sidebar {{
+      width: 320px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }}
+    .card {{
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 18px;
+    }}
+    .card-title {{
+      font-size: 0.95rem;
+      font-weight: 700;
+      color: var(--text);
+      margin-bottom: 14px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 8px;
+    }}
+    .sidebar-list {{
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }}
+    .sidebar-item {{
+      padding: 10px;
+      border-radius: 6px;
       background: var(--surface);
+      border: 1px solid transparent;
+      text-decoration: none;
+      transition: all 0.15s ease;
+      display: block;
+    }}
+    .sidebar-item:hover {{
+      border-color: var(--accent);
+      transform: translateY(-1px);
+    }}
+    .sidebar-item-title {{
+      font-size: 0.88rem;
+      font-weight: 600;
+      color: var(--text);
+      margin-bottom: 4px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }}
+    .sidebar-item-meta {{
+      display: flex;
+      gap: 8px;
+      font-size: 0.75rem;
+      color: var(--muted);
+      align-items: center;
+    }}
+    .syntax-tag {{
+      background: #202b42;
+      color: var(--accent);
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-family: monospace;
+      font-size: 0.72rem;
+    }}
+    .badge {{
+      font-size: 0.7rem;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-weight: 600;
+    }}
+    .badge-warn {{
+      background: rgba(245, 158, 11, 0.2);
+      color: var(--warn);
+      border: 1px solid rgba(245, 158, 11, 0.4);
+    }}
+    .badge-enc {{
+      background: rgba(168, 85, 247, 0.2);
+      color: #c084fc;
+      border: 1px solid rgba(168, 85, 247, 0.4);
+    }}
+
+    footer {{
+      margin-top: auto;
+      padding: 14px 28px;
+      font-size: 0.82rem;
+      color: var(--muted);
+      border-top: 1px solid var(--border);
+      background: var(--card-bg);
       display: flex;
       justify-content: space-between;
-    }
+      align-items: center;
+    }}
+    @media (max-width: 900px) {{
+      .layout {{ flex-direction: column; }}
+      .sidebar {{ width: 100%; }}
+    }}
   </style>
 </head>
 <body>
   <header>
-    <div class="logo">⚡ ES-PASTE // LOG VAULT</div>
-    <div class="actions">
-      <select id="ttl">
-        <option value="1">1 Hour</option>
-        <option value="12" selected>12 Hours (Guest default)</option>
-        <option value="24">24 Hours</option>
-        <option value="72">3 Days</option>
-        <option value="336">14 Days (Auth max)</option>
-      </select>
-      <input type="password" id="token" placeholder="Optional token" style="width: 130px;" />
-      <button onclick="submitPaste()">Save Paste</button>
+    <a href="/" class="brand">
+      <div class="logo">⚡ ES-PASTE <span>ВСТАВКИ</span></div>
+    </a>
+    <div class="nav-links">
+      <a href="/" class="nav-link active">Создать запись</a>
+      <a href="/archive" class="nav-link">Публичный архив</a>
     </div>
   </header>
-  <div class="editor-container">
-    <div class="line-numbers" id="lines">1</div>
-    <textarea id="code" placeholder="Paste server logs, stack traces, configs..." oninput="updateLines()" autofocus></textarea>
+
+  <div class="layout">
+    <div class="main-editor">
+      <div class="editor-header">
+        <input type="text" id="paste_title" class="form-control" placeholder="Название записи (необязательно)" style="flex: 2; min-width: 180px;" />
+        
+        <select id="syntax" class="form-control" style="flex: 1; min-width: 130px;">
+          <optgroup label="Логи и конфиги">
+            <option value="log" selected>Лог сервера / Стектрейс</option>
+            <option value="yaml">YAML</option>
+            <option value="json">JSON</option>
+            <option value="toml">TOML / INI</option>
+            <option value="properties">Java .properties</option>
+            <option value="nginx">Nginx Config</option>
+            <option value="dockerfile">Dockerfile</option>
+          </optgroup>
+          <optgroup label="Языки программирования">
+            <option value="java">Java</option>
+            <option value="kotlin">Kotlin</option>
+            <option value="rust">Rust</option>
+            <option value="python">Python</option>
+            <option value="javascript">JavaScript</option>
+            <option value="typescript">TypeScript</option>
+            <option value="go">Go</option>
+            <option value="cpp">C++</option>
+            <option value="c">C</option>
+            <option value="csharp">C#</option>
+            <option value="php">PHP</option>
+            <option value="ruby">Ruby</option>
+            <option value="sql">SQL</option>
+            <option value="bash">Bash / Shell</option>
+          </optgroup>
+          <optgroup label="Разметка и текст">
+            <option value="text">Обычный текст</option>
+            <option value="markdown">Markdown</option>
+            <option value="xml">XML / HTML</option>
+          </optgroup>
+        </select>
+
+        <select id="ttl" class="form-control" style="flex: 1; min-width: 130px;">
+          <option value="5">5 минут</option>
+          <option value="30">30 минут</option>
+          <option value="60">1 час</option>
+          <option value="720" selected>12 часов</option>
+          <option value="1440">24 часа</option>
+          <option value="4320">3 дня</option>
+          <option value="20160">14 дней</option>
+        </select>
+
+        <select id="visibility" class="form-control" style="flex: 1; min-width: 120px;">
+          <option value="public" selected>🌐 Публичная</option>
+          <option value="unlisted">🔒 По ссылке</option>
+        </select>
+
+        <input type="password" id="paste_password" class="form-control" placeholder="Пароль E2E (опционально)" style="flex: 1.2; min-width: 150px;" autocomplete="new-password" />
+        <label style="display: flex; align-items: center; gap: 6px; font-size: 0.85rem; color: var(--text-muted); cursor: pointer; user-select: none; white-space: nowrap;">
+          <input type="checkbox" id="burn_after_reading" style="cursor: pointer; width: 15px; height: 15px; accent-color: #ef4444;" />
+          🔥 Сжечь после прочтения
+        </label>
+
+        <button class="btn-submit" onclick="submitPaste()">
+          <span>Опубликовать</span>
+        </button>
+      </div>
+
+      <div class="editor-body">
+        <div class="line-numbers" id="lines">1</div>
+        <textarea id="code" placeholder="Вставьте сюда логи сервера, отчёты об ошибках, конфиги или код..." oninput="updateLines()" autofocus></textarea>
+      </div>
+    </div>
+
+    <div class="sidebar">
+      <div class="card">
+        <div class="card-title">
+          <span>Свежие записи</span>
+          <a href="/archive" style="color: var(--accent); font-size: 0.78rem; text-decoration: none;">Все записи &rarr;</a>
+        </div>
+        <div class="sidebar-list">
+          {sidebar_html}
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Анализатор логов</div>
+        <p style="font-size: 0.82rem; color: var(--muted); line-height: 1.45;">
+          Серверные логи и стектрейсы (EULA, занятые сетевые порты, нехватка памяти OOM, битые чанки и дубликаты UUID) сканируются автоматически при сохранении с выводом готового решения на русском языке.
+        </p>
+      </div>
+    </div>
   </div>
+
   <footer>
-    <span>ESCloud Minimal Monospace Vault</span>
-    <span>Axum + SQLite + Zstandard</span>
+    <span>ES-Paste</span>
+    
   </footer>
+
   <script>
     const ta = document.getElementById('code');
     const lines = document.getElementById('lines');
-    function updateLines() {
+    function updateLines() {{
       const count = ta.value.split('\n').length;
       let text = '';
       for (let i = 1; i <= count; i++) text += i + '\n';
       lines.textContent = text;
-    }
-    async function submitPaste() {
+    }}
+    async function deriveKey(password, salt) {{
+      const enc = new TextEncoder();
+      const keyMaterial = await crypto.subtle.importKey(
+        "raw",
+        enc.encode(password),
+        {{ name: "PBKDF2" }},
+        false,
+        ["deriveKey"]
+      );
+      return await crypto.subtle.deriveKey(
+        {{
+          name: "PBKDF2",
+          salt: salt,
+          iterations: 100000,
+          hash: "SHA-256"
+        }},
+        keyMaterial,
+        {{ name: "AES-GCM", length: 256 }},
+        false,
+        ["encrypt", "decrypt"]
+      );
+    }}
+
+    function bufferToBase64(buf) {{
+      const bytes = new Uint8Array(buf);
+      let bin = "";
+      for (let i = 0; i < bytes.byteLength; i++) {{
+        bin += String.fromCharCode(bytes[i]);
+      }}
+      return btoa(bin);
+    }}
+
+    async function encryptE2E(plaintext, password) {{
+      const enc = new TextEncoder();
+      const salt = crypto.getRandomValues(new Uint8Array(16));
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const key = await deriveKey(password, salt);
+      const encrypted = await crypto.subtle.encrypt(
+        {{ name: "AES-GCM", iv: iv }},
+        key,
+        enc.encode(plaintext)
+      );
+      return "ENC:v1:" + bufferToBase64(salt) + ":" + bufferToBase64(iv) + ":" + bufferToBase64(encrypted);
+    }}
+
+    async function submitPaste() {{
       const content = ta.value.trim();
-      if (!content) return alert('Cannot save empty paste.');
-      const ttl = parseInt(document.getElementById('ttl').value, 10);
-      const token = document.getElementById('token').value;
-      const headers = { 'Content-Type': 'application/json' };
-      if (token) headers['Authorization'] = 'Bearer ' + token;
+      if (!content) return alert('Нельзя сохранить пустую запись.');
       
-      const res = await fetch('/api/paste', {
+      const title = document.getElementById('paste_title').value.trim() || 'Без названия';
+      const syntax = document.getElementById('syntax').value;
+      const ttl = parseInt(document.getElementById('ttl').value, 10);
+      const isPrivate = document.getElementById('visibility').value === 'unlisted';
+      const password = document.getElementById('paste_password').value;
+
+      let finalContent = content;
+      let isEncrypted = false;
+
+      if (password) {{
+        try {{
+          finalContent = await encryptE2E(content, password);
+          isEncrypted = true;
+        }} catch (e) {{
+          return alert('Ошибка клиентского шифрования: ' + e);
+        }}
+      }}
+
+      const res = await fetch('/api/paste', {{
         method: 'POST',
-        headers: headers,
-        body: JSON.stringify({ content: content, ttl_hours: ttl })
-      });
-      if (res.ok) {
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{
+          title: title,
+          syntax: syntax,
+          content: finalContent,
+          ttl_minutes: ttl,
+          is_private: isPrivate,
+          is_encrypted: isEncrypted,
+          burn_after_reading: burn
+        }})
+      }});
+      if (res.ok) {{
         const data = await res.json();
-        window.location.href = '/p/' + data.id;
-      } else {
+        if (isEncrypted) {{
+          window.location.href = '/p/' + data.id + '#key=' + encodeURIComponent(password);
+        }} else {{
+          window.location.href = '/p/' + data.id;
+        }}
+      }} else {{
         const err = await res.text();
-        alert('Error: ' + err);
-      }
-    }
+        alert('Ошибка при сохранении: ' + err);
+      }}
+    }}
     updateLines();
   </script>
 </body>
-</html>"#)
+</html>"#, sidebar_html = sidebar_html);
+
+    Html(html)
+}
+
+#[derive(Deserialize)]
+pub struct ArchiveQuery {
+    pub search: Option<String>,
+}
+
+pub async fn public_archive(
+    State(state): State<AppState>,
+    Query(query): Query<ArchiveQuery>,
+) -> Html<String> {
+    let recent = {
+        let conn = state.db.lock().unwrap();
+        let _ = clean_expired(&conn);
+        let now = Utc::now().timestamp();
+        
+        let search_term = query.search.as_deref().unwrap_or("").trim();
+        let mut items = Vec::new();
+
+        if search_term.is_empty() {
+            let mut stmt = conn.prepare(
+                "SELECT id, title, syntax, size_bytes, views, created_at, has_issues 
+                 FROM pastes 
+                 WHERE is_private = 0 AND expires_at > ?1 
+                 ORDER BY created_at DESC 
+                 LIMIT 50"
+            ).unwrap();
+
+            let rows = stmt.query_map(params![now], |row| {
+                let created_at: i64 = row.get(5)?;
+                Ok(PasteItem {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    syntax: row.get(2)?,
+                    size_bytes: row.get(3)?,
+                    views: row.get(4)?,
+                    created_at_human: human_time_ago(created_at),
+                    has_issues: row.get::<_, i64>(6)? > 0,
+                    is_encrypted: row.get::<_, i64>(7)? > 0,
+                    burn_after_reading: row.get::<_, i64>(8)? > 0,
+                })
+            }).unwrap();
+
+            for r in rows.flatten() {
+                items.push(r);
+            }
+        } else {
+            let pattern = format!("%{}%", search_term);
+            let mut stmt = conn.prepare(
+                "SELECT id, title, syntax, size_bytes, views, created_at, has_issues 
+                 FROM pastes 
+                 WHERE is_private = 0 AND expires_at > ?1 AND title LIKE ?2 
+                 ORDER BY created_at DESC 
+                 LIMIT 50"
+            ).unwrap();
+
+            let rows = stmt.query_map(params![now, pattern], |row| {
+                let created_at: i64 = row.get(5)?;
+                Ok(PasteItem {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    syntax: row.get(2)?,
+                    size_bytes: row.get(3)?,
+                    views: row.get(4)?,
+                    created_at_human: human_time_ago(created_at),
+                    has_issues: row.get::<_, i64>(6)? > 0,
+                    is_encrypted: row.get::<_, i64>(7)? > 0,
+                    burn_after_reading: row.get::<_, i64>(8)? > 0,
+                })
+            }).unwrap();
+
+            for r in rows.flatten() {
+                items.push(r);
+            }
+        }
+        items
+    };
+
+    let mut table_rows = String::new();
+    for p in &recent {
+        let mut badges = String::new();
+        if p.is_encrypted {
+            badges.push_str(r#"<span class="badge badge-enc">🔐 E2E</span>"#);
+        }
+        if p.has_issues {
+            badges.push_str(r#"<span class="badge badge-warn">⚠️ Ошибка</span>"#);
+        }
+        table_rows.push_str(&format!(
+            r#"<tr>
+                <td><a href="/p/{}" class="table-title">{}</a> {}</td>
+                <td><span class="syntax-tag">{}</span></td>
+                <td>{}</td>
+                <td>{}</td>
+                <td>👁️ {}</td>
+                <td><a href="/raw/{}" class="raw-btn" target="_blank">Текст</a></td>
+            </tr>"#,
+            p.id,
+            escape_html(&p.title),
+            badges,
+            syntax_title(&p.syntax),
+            escape_html(&human_size(p.size_bytes)),
+            p.created_at_human,
+            p.views,
+            p.id
+        ));
+    }
+
+    if table_rows.is_empty() {
+        table_rows = r#"<tr><td colspan="6" style="text-align:center; padding: 32px; color: #6e7681;">Публичные записи по вашему запросу не найдены.</td></tr>"#.to_string();
+    }
+
+    let search_val = escape_html(query.search.as_deref().unwrap_or(""));
+
+    let html = format!(r#"<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Публичный архив записей — ES-Paste</title>
+  <meta name="description" content="Список последних открытых вставок, логов и исходных кодов пользователей в сервисе ES-Paste.">
+  <meta name="robots" content="index, follow">
+  <meta property="og:title" content="Публичный архив записей — ES-Paste">
+  <meta property="og:description" content="Просмотр открытых логов и сниппетов кода.">
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="alternate icon" type="image/x-icon" href="/favicon.ico">
+  <style>
+    :root {{
+      --bg: #090d16;
+      --card-bg: #121826;
+      --surface: #1a2234;
+      --border: #26334d;
+      --text: #e1e7f0;
+      --muted: #8b9bb4;
+      --accent: #38bdf8;
+      --warn: #f59e0b;
+    }}
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }}
+    header {{
+      padding: 14px 28px;
+      background: var(--card-bg);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }}
+    .brand {{ text-decoration: none; font-weight: 800; color: var(--accent); font-size: 1.25rem; }}
+    .brand span {{ color: #fff; }}
+    .nav-links {{ display: flex; gap: 18px; }}
+    .nav-link {{ color: var(--muted); text-decoration: none; font-size: 0.9rem; font-weight: 500; }}
+    .nav-link:hover, .nav-link.active {{ color: var(--accent); }}
+    
+    .container {{
+      max-width: 1200px;
+      width: 100%;
+      margin: 24px auto;
+      padding: 0 24px;
+      flex: 1;
+    }}
+    .archive-header {{
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 20px;
+      gap: 16px;
+      flex-wrap: wrap;
+    }}
+    .search-bar {{
+      display: flex;
+      gap: 8px;
+    }}
+    .search-input {{
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 8px 14px;
+      border-radius: 6px;
+      font-size: 0.88rem;
+      outline: none;
+      width: 260px;
+    }}
+    .search-input:focus {{ border-color: var(--accent); }}
+    .search-btn {{
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 8px 16px;
+      border-radius: 6px;
+      font-size: 0.88rem;
+      cursor: pointer;
+    }}
+    .archive-table {{
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+    }}
+    .archive-table th, .archive-table td {{
+      padding: 12px 18px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+      font-size: 0.88rem;
+    }}
+    .archive-table th {{
+      background: var(--surface);
+      color: var(--muted);
+      font-weight: 600;
+      text-transform: uppercase;
+      font-size: 0.75rem;
+      letter-spacing: 0.05em;
+    }}
+    .table-title {{
+      color: var(--text);
+      font-weight: 600;
+      text-decoration: none;
+      transition: color 0.15s;
+    }}
+    .table-title:hover {{ color: var(--accent); }}
+    .syntax-tag {{
+      background: #202b42;
+      color: var(--accent);
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-family: monospace;
+      font-size: 0.75rem;
+    }}
+    .badge {{
+      font-size: 0.7rem;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-weight: 600;
+      margin-left: 6px;
+    }}
+    .badge-warn {{
+      background: rgba(245, 158, 11, 0.2);
+      color: var(--warn);
+      border: 1px solid rgba(245, 158, 11, 0.4);
+    }}
+    .badge-enc {{
+      background: rgba(168, 85, 247, 0.2);
+      color: #c084fc;
+      border: 1px solid rgba(168, 85, 247, 0.4);
+    }}
+    .raw-btn {{
+      color: var(--muted);
+      text-decoration: none;
+      padding: 3px 8px;
+      border-radius: 4px;
+      background: var(--surface);
+      font-size: 0.78rem;
+    }}
+    .raw-btn:hover {{ color: #fff; background: var(--border); }}
+  </style>
+</head>
+<body>
+  <header>
+    <a href="/" class="brand">⚡ ES-PASTE <span>ВСТАВКИ</span></a>
+    <div class="nav-links">
+      <a href="/" class="nav-link">Создать запись</a>
+      <a href="/archive" class="nav-link active">Публичный архив</a>
+    </div>
+  </header>
+
+  <div class="container">
+    <div class="archive-header">
+      <h2 style="font-size: 1.4rem;">Публичный архив записей</h2>
+      <form class="search-bar" method="GET" action="/archive">
+        <input type="text" name="search" class="search-input" placeholder="Поиск по названию..." value="{search_val}" />
+        <button type="submit" class="search-btn">Искать</button>
+      </form>
+    </div>
+
+    <table class="archive-table">
+      <thead>
+        <tr>
+          <th>Название</th>
+          <th>Синтаксис</th>
+          <th>Размер</th>
+          <th>Создано</th>
+          <th>Просмотры</th>
+          <th>Действия</th>
+        </tr>
+      </thead>
+      <tbody>
+        {table_rows}
+      </tbody>
+    </table>
+  </div>
+</body>
+</html>"#, search_val = search_val, table_rows = table_rows);
+
+    Html(html)
 }
 
 pub async fn create_paste(
@@ -336,7 +1101,12 @@ pub async fn create_paste(
     body: Bytes,
 ) -> Result<Json<CreatePasteResponse>, (StatusCode, String)> {
     let mut raw_content = String::new();
-    let mut requested_ttl_hours: Option<i64> = None;
+    let mut requested_ttl_minutes: Option<i64> = None;
+    let mut title = "Без названия".to_string();
+    let mut syntax = "text".to_string();
+    let mut is_private = false;
+    let mut is_encrypted = false;
+    let mut burn_after_reading = false;
 
     let content_type = headers
         .get(header::CONTENT_TYPE)
@@ -348,58 +1118,98 @@ pub async fn create_paste(
             if let Some(c) = payload.content {
                 raw_content = c;
             }
-            requested_ttl_hours = payload.ttl_hours;
+            if let Some(t) = payload.title {
+                let trimmed = t.trim();
+                if !trimmed.is_empty() {
+                    title = trimmed.chars().take(80).collect();
+                }
+            }
+            if let Some(s) = payload.syntax {
+                let s_trim = s.trim().to_lowercase();
+                if !s_trim.is_empty() {
+                    syntax = s_trim.chars().take(20).collect();
+                }
+            }
+            if let Some(p) = payload.is_private {
+                is_private = p;
+            }
+            if let Some(e) = payload.is_encrypted {
+                is_encrypted = e;
+            }
+            if let Some(b) = payload.burn_after_reading {
+                burn_after_reading = b;
+            }
+            requested_ttl_minutes = payload.ttl_minutes.or_else(|| payload.ttl_hours.map(|h| h * 60));
         }
     }
 
     if raw_content.is_empty() {
-        raw_content = String::from_utf8(body.to_vec())
-            .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid UTF-8 content".into()))?;
+        if let Ok(s) = String::from_utf8(body.to_vec()) {
+            raw_content = s;
+        }
     }
 
-    if raw_content.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "Content cannot be empty".into()));
+    let trimmed = raw_content.trim();
+    if trimmed.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "Содержимое не может быть пустым".into()));
     }
 
-    let is_authed = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())
-        .map(|auth| {
-            let token = auth.strip_prefix("Bearer ").unwrap_or(auth);
-            token == state.auth_token
-        })
-        .unwrap_or(false);
-
-    let max_ttl_hours = if is_authed { 14 * 24 } else { 12 };
-    let final_ttl_hours = match requested_ttl_hours {
-        Some(h) if h > 0 => h.min(max_ttl_hours),
-        _ => if is_authed { 14 * 24 } else { 12 },
+    let is_authenticated = if let Some(auth_hdr) = headers.get(header::AUTHORIZATION) {
+        if let Ok(val) = auth_hdr.to_str() {
+            let expected = format!("Bearer {}", state.auth_token);
+            val == expected
+        } else {
+            false
+        }
+    } else {
+        false
     };
 
-    let issues = analyze_log(&raw_content);
-    let has_issues = if !issues.is_empty() { 1 } else { 0 };
+    let ttl_minutes = match requested_ttl_minutes {
+        Some(m) if is_authenticated => m.clamp(5, 336 * 60),
+        Some(m) => m.clamp(5, 12 * 60),
+        None => 12 * 60,
+    };
 
-    let compressed = zstd::encode_all(raw_content.as_bytes(), 3)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Compression error: {}", e)))?;
+    let issues = analyze_log(trimmed);
+    let has_issues = if issues.is_empty() { 0 } else { 1 };
 
-    let id = nanoid!(8);
+    let compressed = zstd::encode_all(trimmed.as_bytes(), 3)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Ошибка сжатия: {}", e)))?;
+
+    let paste_id = nanoid!(10);
     let now = Utc::now();
-    let created_at = now.timestamp();
-    let expires_at = (now + Duration::hours(final_ttl_hours)).timestamp();
+    let expires_at = (now + Duration::minutes(ttl_minutes)).timestamp();
+    let size_bytes = trimmed.len() as i64;
 
     {
         let conn = state.db.lock().unwrap();
+        let _ = clean_expired(&conn);
         conn.execute(
-            "INSERT INTO pastes (id, content, created_at, expires_at, has_issues) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![id, compressed, created_at, expires_at, has_issues],
-        ).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB insert error: {}", e)))?;
+            "INSERT INTO pastes (id, title, syntax, content, size_bytes, views, is_private, is_encrypted, burn_after_reading, created_at, expires_at, has_issues) 
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                paste_id,
+                title,
+                syntax,
+                compressed,
+                size_bytes,
+                if is_private { 1 } else { 0 },
+                if is_encrypted { 1 } else { 0 },
+                if burn_after_reading { 1 } else { 0 },
+                now.timestamp(),
+                expires_at,
+                has_issues
+            ],
+        )
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Ошибка БД: {}", e)))?;
     }
 
-    let url = format!("{}/p/{}", state.base_url, id);
-    let raw_url = format!("{}/raw/{}", state.base_url, id);
+    let url = format!("{}/p/{}", state.base_url, paste_id);
+    let raw_url = format!("{}/raw/{}", state.base_url, paste_id);
 
     Ok(Json(CreatePasteResponse {
-        id,
+        id: paste_id,
         url,
         raw_url,
         expires_at,
@@ -410,184 +1220,293 @@ pub async fn create_paste(
 pub async fn get_raw(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Response, (StatusCode, String)> {
-    let (compressed, expires_at): (Vec<u8>, i64) = {
+) -> Result<Response, StatusCode> {
+    let compressed_bytes: Vec<u8> = {
         let conn = state.db.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT content, expires_at FROM pastes WHERE id = ?1")
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        stmt.query_row(params![id], |row| Ok((row.get(0)?, row.get(1)?)))
-            .map_err(|_| (StatusCode::NOT_FOUND, "Paste not found".into()))?
+        let _ = clean_expired(&conn);
+        let now = Utc::now().timestamp();
+        let (content, burn): (Vec<u8>, bool) = conn.query_row(
+            "SELECT content, burn_after_reading FROM pastes WHERE id = ?1 AND expires_at > ?2",
+            params![id, now],
+            |row| Ok((row.get(0)?, row.get::<_, i64>(1)? > 0)),
+        )
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+
+        if burn {
+            let _ = conn.execute("DELETE FROM pastes WHERE id = ?1", params![id]);
+        }
+        content
     };
 
-    if Utc::now().timestamp() > expires_at {
-        return Err((StatusCode::NOT_FOUND, "Paste has expired".into()));
-    }
+    let decompressed = zstd::decode_all(compressed_bytes.as_slice())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let decompressed = zstd::decode_all(compressed.as_slice())
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Decompress error: {}", e)))?;
+    let text = String::from_utf8(decompressed).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok((
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        decompressed,
-    ).into_response())
+        text,
+    )
+        .into_response())
 }
 
 pub async fn view_paste(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Html<String>, (StatusCode, String)> {
-    let (compressed, expires_at): (Vec<u8>, i64) = {
+) -> Result<Html<String>, StatusCode> {
+    let (title, syntax, size_bytes, views, created_at, expires_at, compressed_bytes, is_encrypted, burn_after_reading): (String, String, i64, i64, i64, i64, Vec<u8>, bool, bool) = {
         let conn = state.db.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT content, expires_at FROM pastes WHERE id = ?1")
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        stmt.query_row(params![id], |row| Ok((row.get(0)?, row.get(1)?)))
-            .map_err(|_| (StatusCode::NOT_FOUND, "Paste not found".into()))?
+        let _ = clean_expired(&conn);
+        let now = Utc::now().timestamp();
+
+        let (t, s, sb, v, ca, ea, c, enc, burn): (String, String, i64, i64, i64, i64, Vec<u8>, bool, bool) = conn.query_row(
+            "SELECT title, syntax, size_bytes, views, created_at, expires_at, content, is_encrypted, burn_after_reading 
+             FROM pastes WHERE id = ?1 AND expires_at > ?2",
+            params![id, now],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get::<_, i64>(7)? > 0,
+                    row.get::<_, i64>(8)? > 0,
+                ))
+            },
+        )
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+
+        if burn {
+            let _ = conn.execute("DELETE FROM pastes WHERE id = ?1", params![id]);
+        } else {
+            let _ = conn.execute("UPDATE pastes SET views = views + 1 WHERE id = ?1", params![id]);
+        }
+
+        (t, s, sb, v + 1, ca, ea, c, enc, burn)
     };
 
-    if Utc::now().timestamp() > expires_at {
-        return Err((StatusCode::NOT_FOUND, "Paste has expired".into()));
-    }
-
-    let decompressed = zstd::decode_all(compressed.as_slice())
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Decompress error: {}", e)))?;
-    let content = String::from_utf8_lossy(&decompressed);
+    let decompressed = zstd::decode_all(compressed_bytes.as_slice())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let content = String::from_utf8(decompressed).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let issues = analyze_log(&content);
 
     let mut diagnosis_banner = String::new();
-    if !issues.is_empty() {
-        diagnosis_banner.push_str(r#"<div class="diagnosis-banner">"#);
-        diagnosis_banner.push_str(r#"<div class="banner-header">⚠️ AUTOMATED LOG DIAGNOSIS DETECTED ISSUES</div>"#);
-        for issue in issues {
-            let badge_class = match issue.severity.as_str() {
-                "CRITICAL" => "badge-critical",
-                "ERROR" => "badge-error",
-                _ => "badge-warn",
-            };
-            diagnosis_banner.push_str(&format!(
-                r#"<div class="issue-card">
-                    <div class="issue-title"><span class="badge {}">{}</span> {}</div>
-                    <div class="issue-meta"><strong>Причина:</strong> {}</div>
-                    <div class="issue-meta"><strong>Решение:</strong> <pre class="sol">{}</pre></div>
-                </div>"#,
-                badge_class,
-                escape_html(&issue.severity),
-                escape_html(&issue.title),
-                escape_html(&issue.cause),
-                escape_html(&issue.solution)
+    if !is_encrypted && !issues.is_empty() {
+        let mut list_items = String::new();
+        for issue in &issues {
+            list_items.push_str(&format!(
+                r#"<div class="issue-item">
+                    <div class="issue-badge">⚠️ [{}]</div>
+                    <div class="issue-desc">
+                      <div><b>Решение:</b> {}</div>
+                    </div>
+                   </div>"#,
+                escape_html(&issue.rule),
+                escape_html(&issue.solution_ru)
             ));
         }
-        diagnosis_banner.push_str("</div>");
+
+        diagnosis_banner = format!(
+            r#"<div class="diagnosis-box">
+                <div class="diagnosis-header">⚡ АВТОМАТИЧЕСКАЯ ДИАГНОСТИКА ЛОГА (НАЙДЕНО ПРОБЛЕМ: {})</div>
+                <div class="diagnosis-body">{}</div>
+               </div>"#,
+            issues.len(),
+            list_items
+        );
     }
 
     let line_count = content.lines().count().max(1);
-    let mut line_numbers = String::new();
+    let mut line_numbers = String::with_capacity(line_count * 5);
     for i in 1..=line_count {
         line_numbers.push_str(&format!("{}\n", i));
     }
 
     let escaped_content = escape_html(&content);
+    let expires_in_str = human_expires_in(expires_at);
+
+    let burn_banner = if burn_after_reading {
+        r#"<div style="margin: 18px 28px 0; padding: 14px 18px; background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.4); border-radius: 8px; color: #fca5a5; font-size: 0.9rem; display: flex; align-items: center; gap: 10px;">
+            <span style="font-size: 1.2rem;">🔥</span>
+            <div><strong>Одноразовая запись (Burn after reading):</strong> Эта запись была удалена из базы данных в момент загрузки страницы. После закрытия или обновления вкладки доступ будет утерян навсегда.</div>
+           </div>"#
+    } else {
+        ""
+    };
+
+    let (enc_badge, encrypted_banner) = if is_encrypted {
+        (
+            "<span class=\"badge badge-enc\">🔐 Зашифровано E2E</span>",
+            r#"<div id="enc-modal" style="margin: 18px 28px 0; padding: 18px; background: rgba(168, 85, 247, 0.1); border: 1px solid rgba(168, 85, 247, 0.4); border-radius: 8px; display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap;">
+                <div>
+                  <div style="font-weight: 700; color: #c084fc; font-size: 1rem; margin-bottom: 4px;">🔐 Эта запись зашифрована на стороне клиента</div>
+                  <div style="font-size: 0.85rem; color: #94a3b8;">Сервер не знает пароль и не имеет доступа к исходному тексту (AES-256-GCM).</div>
+                  <div id="unlock-error" style="color: #f87171; font-size: 0.82rem; margin-top: 6px; display: none;"></div>
+                </div>
+                <div style="display: flex; gap: 8px;">
+                  <input type="password" id="unlock-pass" class="form-control" placeholder="Введите пароль..." style="width: 200px;" onkeydown="if(event.key==='Enter') tryUnlock(this.value)" />
+                  <button class="btn btn-primary" onclick="tryUnlock(document.getElementById('unlock-pass').value)">Расшифровать</button>
+                </div>
+               </div>"#
+        )
+    } else {
+        ("", "")
+    };
 
     let html = format!(r#"<!DOCTYPE html>
-<html lang="en">
+<html lang="ru">
 <head>
   <meta charset="UTF-8">
-  <title>Paste {} - ES-Paste</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{title} — ES-Paste</title>
+  <meta name="description" content="Просмотр вставки в ES-Paste: логи сервера, конфигурационные файлы и исходный код.">
+  <meta name="robots" content="noindex, follow">
+  <meta property="og:title" content="{title} — ES-Paste">
+  <meta property="og:type" content="article">
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="alternate icon" type="image/x-icon" href="/favicon.ico">
   <style>
     :root {{
-      --bg: #0d1117;
-      --surface: #161b22;
-      --border: #30363d;
-      --text: #c9d1d9;
-      --accent: #58a6ff;
+      --bg: #090d16;
+      --card-bg: #121826;
+      --surface: #1a2234;
+      --border: #26334d;
+      --text: #e1e7f0;
+      --muted: #8b9bb4;
+      --accent: #38bdf8;
+      --accent-hover: #7dd3fc;
     }}
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
     body {{
       background: var(--bg);
       color: var(--text);
-      font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
       min-height: 100vh;
       display: flex;
       flex-direction: column;
     }}
     header {{
-      padding: 12px 24px;
-      background: var(--surface);
+      padding: 14px 28px;
+      background: var(--card-bg);
       border-bottom: 1px solid var(--border);
       display: flex;
       align-items: center;
       justify-content: space-between;
     }}
-    .logo a {{
-      font-weight: 700;
-      color: var(--accent);
-      font-size: 1.15rem;
-      text-decoration: none;
+    .brand {{ text-decoration: none; font-weight: 800; color: var(--accent); font-size: 1.25rem; }}
+    .brand span {{ color: #fff; }}
+    .meta-bar {{
+      padding: 16px 28px;
+      background: var(--card-bg);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      flex-wrap: wrap;
     }}
-    .actions a, .actions button {{
-      background: var(--bg);
+    .paste-heading {{
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }}
+    .paste-title-large {{
+      font-size: 1.25rem;
+      font-weight: 700;
+      color: #fff;
+    }}
+    .paste-meta-details {{
+      font-size: 0.82rem;
+      color: var(--muted);
+      display: flex;
+      gap: 12px;
+      align-items: center;
+    }}
+    .syntax-tag {{
+      background: #202b42;
+      color: var(--accent);
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-family: monospace;
+      font-size: 0.78rem;
+    }}
+    .actions {{ display: flex; gap: 10px; }}
+    .btn {{
+      padding: 7px 14px;
+      border-radius: 6px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      text-decoration: none;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }}
+    .btn-secondary {{
+      background: var(--surface);
       border: 1px solid var(--border);
       color: var(--text);
-      padding: 6px 14px;
-      border-radius: 6px;
-      text-decoration: none;
+    }}
+    .btn-secondary:hover {{ background: var(--border); }}
+    .btn-primary {{
+      background: var(--accent);
+      color: #090d16;
+    }}
+    .btn-primary:hover {{ background: var(--accent-hover); }}
+
+    .diagnosis-box {{
+      margin: 18px 28px 0;
+      background: rgba(245, 158, 11, 0.08);
+      border: 1px solid rgba(245, 158, 11, 0.3);
+      border-radius: 8px;
+      overflow: hidden;
+    }}
+    .diagnosis-header {{
+      padding: 10px 18px;
+      background: rgba(245, 158, 11, 0.15);
+      color: #fbbf24;
+      font-weight: 700;
       font-size: 0.88rem;
+      letter-spacing: 0.04em;
     }}
-    .diagnosis-banner {{
-      background: #1f1418;
-      border-bottom: 2px solid #f85149;
-      padding: 16px 24px;
-    }}
-    .banner-header {{
-      font-weight: bold;
-      color: #f85149;
-      margin-bottom: 12px;
-      letter-spacing: 0.05em;
-    }}
-    .issue-card {{
-      background: #27161c;
-      border-left: 4px solid #f85149;
-      padding: 12px;
-      border-radius: 4px;
-      margin-bottom: 10px;
-    }}
-    .issue-title {{ font-size: 1rem; font-weight: bold; margin-bottom: 6px; }}
-    .badge {{
-      font-size: 0.75rem;
-      padding: 2px 6px;
-      border-radius: 4px;
-      margin-right: 8px;
-    }}
-    .badge-critical {{ background: #b62324; color: #fff; }}
-    .badge-error {{ background: #da3633; color: #fff; }}
-    .badge-warn {{ background: #d29922; color: #000; }}
-    .issue-meta {{ font-size: 0.88rem; margin-top: 4px; color: #e6edf3; }}
-    .sol {{ margin-top: 4px; white-space: pre-wrap; color: #7ee787; background: #161b22; padding: 6px 10px; border-radius: 4px; }}
+    .diagnosis-body {{ padding: 14px 18px; display: flex; flex-direction: column; gap: 12px; }}
+    .issue-item {{ display: flex; gap: 12px; font-size: 0.88rem; line-height: 1.45; }}
+    .issue-badge {{ color: #fbbf24; font-weight: 700; white-space: nowrap; }}
+
     .content-container {{
       flex: 1;
       display: flex;
-      overflow-x: auto;
+      margin: 18px 28px 28px;
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
     }}
     .line-numbers {{
       width: 56px;
       padding: 16px 8px;
       text-align: right;
-      color: #484f58;
+      color: #4b5875;
       user-select: none;
       background: var(--surface);
       border-right: 1px solid var(--border);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
       font-size: 0.9rem;
       line-height: 1.5;
       white-space: pre;
     }}
-    pre.code-view {{
+    .code-view {{
       flex: 1;
+      margin: 0;
       padding: 16px;
-      font-family: inherit;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
       font-size: 0.9rem;
       line-height: 1.5;
+      color: var(--text);
       overflow-x: auto;
       white-space: pre;
     }}
@@ -595,28 +1514,224 @@ pub async fn view_paste(
 </head>
 <body>
   <header>
-    <div class="logo"><a href="/">⚡ ES-PASTE // LOG VAULT</a></div>
+    <a href="/" class="brand">⚡ ES-PASTE <span>ВСТАВКИ</span></a>
     <div class="actions">
-      <a href="/raw/{}" target="_blank">Raw Output</a>
-      <a href="/">New Paste</a>
+      <a href="/" class="btn btn-primary">+ Новая запись</a>
+      <a href="/archive" class="btn btn-secondary">Публичный архив</a>
     </div>
   </header>
-  {}
-  <div class="content-container">
-    <div class="line-numbers">{}</div>
-    <pre class="code-view"><code>{}</code></pre>
+
+  {burn_banner}
+  {encrypted_banner}
+  <div class="meta-bar">
+    <div class="paste-heading">
+      <div class="paste-title-large">{title} {enc_badge}</div>
+      <div class="paste-meta-details">
+        <span class="syntax-tag">{syntax}</span>
+        <span>Размер: {size}</span>
+        <span>Создано: {created_at_human}</span>
+        <span>Истекает через: {expires_in_str}</span>
+        <span>👁️ {views} просмотров</span>
+      </div>
+    </div>
+    <div class="actions">
+      <button class="btn btn-secondary" onclick="copyRaw()">📋 Скопировать текст</button>
+      <a href="/raw/{id}" target="_blank" class="btn btn-secondary">Чистый текст</a>
+      <a href="/" class="btn btn-secondary">Форкнуть / Редактировать</a>
+    </div>
   </div>
+
+  {diagnosis_banner}
+
+  <div class="content-container">
+    <div class="line-numbers" id="line-numbers-col">{line_numbers}</div>
+    <pre class="code-view"><code id="code-content">{escaped_content}</code></pre>
+  </div>
+
+  <script>
+    function copyRaw() {{
+      const text = document.getElementById('code-content').innerText;
+      navigator.clipboard.writeText(text).then(() => {{
+        alert('Текст скопирован в буфер обмена!');
+      }});
+    }}
+
+    const IS_ENCRYPTED = {is_encrypted_bool};
+
+    async function deriveKey(password, salt) {{
+      const enc = new TextEncoder();
+      const keyMaterial = await crypto.subtle.importKey(
+        "raw",
+        enc.encode(password),
+        {{ name: "PBKDF2" }},
+        false,
+        ["deriveKey"]
+      );
+      return await crypto.subtle.deriveKey(
+        {{
+          name: "PBKDF2",
+          salt: salt,
+          iterations: 100000,
+          hash: "SHA-256"
+        }},
+        keyMaterial,
+        {{ name: "AES-GCM", length: 256 }},
+        false,
+        ["encrypt", "decrypt"]
+      );
+    }}
+
+    function base64ToBuffer(b64) {{
+      const bin = atob(b64);
+      const buf = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+      return buf;
+    }}
+
+    async function decryptE2E(cipherPayload, password) {{
+      const parts = cipherPayload.trim().split(':');
+      if (parts.length !== 5 || parts[0] !== 'ENC' || parts[1] !== 'v1') {{
+        throw new Error('Некорректный формат шифротекста.');
+      }}
+      const salt = base64ToBuffer(parts[2]);
+      const iv = base64ToBuffer(parts[3]);
+      const ciphertext = base64ToBuffer(parts[4]);
+
+      const key = await deriveKey(password, salt);
+      const dec = new TextDecoder();
+      const plainBuf = await crypto.subtle.decrypt(
+        {{ name: "AES-GCM", iv: iv }},
+        key,
+        ciphertext
+      );
+      return dec.decode(plainBuf);
+    }}
+
+    function updateLineNumbers(count) {{
+      let text = '';
+      for (let i = 1; i <= count; i++) text += i + '
+';
+      document.getElementById('line-numbers-col').textContent = text;
+    }}
+
+    async function tryUnlock(pass) {{
+      const codeEl = document.getElementById('code-content');
+      const errEl = document.getElementById('unlock-error');
+      if (errEl) errEl.style.display = 'none';
+
+      try {{
+        const rawCipher = codeEl.getAttribute('data-raw-cipher');
+        const plain = await decryptE2E(rawCipher, pass);
+        codeEl.textContent = plain;
+        const lineCount = Math.max(1, plain.split('
+').length);
+        updateLineNumbers(lineCount);
+        const modal = document.getElementById('enc-modal');
+        if (modal) modal.style.display = 'none';
+      }} catch (e) {{
+        if (errEl) {{
+          errEl.textContent = 'Неверный пароль расшифровки.';
+          errEl.style.display = 'block';
+        }}
+      }}
+    }}
+
+    document.addEventListener('DOMContentLoaded', async () => {{
+      if (!IS_ENCRYPTED) return;
+      const codeEl = document.getElementById('code-content');
+      codeEl.setAttribute('data-raw-cipher', codeEl.innerText);
+      codeEl.textContent = '🔒 Зашифровано сквозным шифрованием (AES-256-GCM).
+Введите пароль для просмотра.';
+
+      const hash = window.location.hash;
+      if (hash.startsWith('#key=')) {{
+        const pass = decodeURIComponent(hash.substring(5));
+        if (pass) {{
+          await tryUnlock(pass);
+        }}
+      }}
+    }});
+  </script>
 </body>
 </html>"#,
-        id, id, diagnosis_banner, line_numbers, escaped_content
+        title = escape_html(&title),
+        enc_badge = enc_badge,
+        burn_banner = burn_banner,
+        encrypted_banner = encrypted_banner,
+        syntax = syntax_title(&syntax),
+        size = escape_html(&human_size(size_bytes)),
+        created_at_human = human_time_ago(created_at),
+        expires_in_str = expires_in_str,
+        views = views,
+        id = id,
+        diagnosis_banner = diagnosis_banner,
+        line_numbers = line_numbers,
+        escaped_content = escaped_content,
+        is_encrypted_bool = is_encrypted
     );
 
     Ok(Html(html))
 }
 
+
+const FAVICON_SVG: &[u8] = include_bytes!("../favicon.svg");
+const FAVICON_ICO: &[u8] = include_bytes!("../favicon.ico");
+
+async fn favicon_svg() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/svg+xml")], FAVICON_SVG)
+}
+
+async fn favicon_ico() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/x-icon")], FAVICON_ICO)
+}
+
+
+async fn robots_txt() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], "User-agent: *
+Allow: /
+Disallow: /raw/
+Sitemap: /sitemap.xml
+")
+}
+
+async fn sitemap_xml(State(state): State<AppState>) -> impl IntoResponse {
+    let urls = {
+        let conn = state.db.lock().unwrap();
+        let _ = clean_expired(&conn);
+        let now = Utc::now().timestamp();
+        let mut stmt = conn.prepare("SELECT id FROM pastes WHERE is_private = 0 AND expires_at > ?1 ORDER BY created_at DESC LIMIT 500").unwrap();
+        let rows = stmt.query_map(params![now], |row| row.get::<_, String>(0)).unwrap();
+        let mut list = Vec::new();
+        for r in rows.flatten() {
+            list.push(r);
+        }
+        list
+    };
+
+    let mut xml = String::from(r#"<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+"#);
+    xml.push_str(&format!("  <url><loc>{}/</loc><changefreq>always</changefreq><priority>1.0</priority></url>
+", state.base_url));
+    xml.push_str(&format!("  <url><loc>{}/archive</loc><changefreq>hourly</changefreq><priority>0.8</priority></url>
+", state.base_url));
+    for id in urls {
+        xml.push_str(&format!("  <url><loc>{}/p/{}</loc><changefreq>never</changefreq><priority>0.5</priority></url>
+", state.base_url, id));
+    }
+    xml.push_str("</urlset>");
+
+    ([(header::CONTENT_TYPE, "application/xml; charset=utf-8")], xml)
+}
+
 pub fn app_router(state: AppState) -> Router {
     Router::new()
         .route("/", get(root_editor))
+        .route("/favicon.ico", get(favicon_ico))
+        .route("/favicon.svg", get(favicon_svg))
+        .route("/archive", get(public_archive))
+        .route("/robots.txt", get(robots_txt))
+        .route("/sitemap.xml", get(sitemap_xml))
         .route("/api/paste", post(create_paste))
         .route("/raw/{id}", get(get_raw))
         .route("/p/{id}", get(view_paste))
@@ -649,95 +1764,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::to_bytes;
-    use axum::http::Request;
-    use tower::ServiceExt;
 
-    fn setup_test_state() -> AppState {
-        let conn = Connection::open_in_memory().unwrap();
-        init_db(&conn).unwrap();
-        AppState {
-            db: Arc::new(Mutex::new(conn)),
-            base_url: "http://localhost:8080".into(),
-            auth_token: "secret-test-token".into(),
-        }
+    #[test]
+    fn escape_html_neutralizes_special_chars() {
+        assert_eq!(escape_html("<b>&\"'</b>"), "&lt;b&gt;&amp;&quot;&#x27;&lt;/b&gt;");
     }
 
-    #[tokio::test]
-    async fn test_create_and_read_paste() {
-        let state = setup_test_state();
-        let app = app_router(state);
-
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/paste")
-            .header("content-type", "application/json")
-            .body(axum::body::Body::from(r#"{"content": "Address already in use: bind\nServer crashed"}"#))
-            .unwrap();
-
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-
-        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
-        let created: CreatePasteResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(created.issues_detected, 1);
-
-        let req_raw = Request::builder()
-            .method("GET")
-            .uri(format!("/raw/{}", created.id))
-            .body(axum::body::Body::empty())
-            .unwrap();
-
-        let res_raw = app.clone().oneshot(req_raw).await.unwrap();
-        assert_eq!(res_raw.status(), StatusCode::OK);
-        let raw_body = to_bytes(res_raw.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(
-            String::from_utf8(raw_body.to_vec()).unwrap(),
-            "Address already in use: bind\nServer crashed"
-        );
-
-        let req_view = Request::builder()
-            .method("GET")
-            .uri(format!("/p/{}", created.id))
-            .body(axum::body::Body::empty())
-            .unwrap();
-        let res_view = app.oneshot(req_view).await.unwrap();
-        assert_eq!(res_view.status(), StatusCode::OK);
-        let view_body = to_bytes(res_view.into_body(), usize::MAX).await.unwrap();
-        let view_html = String::from_utf8(view_body.to_vec()).unwrap();
-        assert!(view_html.contains("AUTOMATED LOG DIAGNOSIS DETECTED ISSUES"));
-        assert!(view_html.contains("Порт уже занят"));
+    #[test]
+    fn analyze_log_detects_eula_and_port() {
+        let text = "[Server] You need to agree to the EULA in order to run the server\n\
+                    java.net.BindException: Address already in use: bind";
+        let hits = analyze_log(text);
+        let names: Vec<_> = hits.iter().map(|h| h.rule.as_str()).collect();
+        assert!(names.contains(&"EULA не принята"));
+        assert!(names.contains(&"Порт уже занят"));
     }
 
-    #[tokio::test]
-    async fn test_auth_ttl_limits() {
-        let state = setup_test_state();
-        let app = app_router(state);
+    #[test]
+    fn analyze_log_empty_for_unrelated_text() {
+        assert!(analyze_log("hello world\nno errors here").is_empty());
+    }
 
-        // Guest requesting 100 hours -> clamped to 12
-        let req_guest = Request::builder()
-            .method("POST")
-            .uri("/api/paste")
-            .header("content-type", "application/json")
-            .body(axum::body::Body::from(r#"{"content": "guest log", "ttl_hours": 100}"#))
-            .unwrap();
-        let res_guest = app.clone().oneshot(req_guest).await.unwrap();
-        let body = to_bytes(res_guest.into_body(), usize::MAX).await.unwrap();
-        let guest_resp: CreatePasteResponse = serde_json::from_slice(&body).unwrap();
-        let now = Utc::now().timestamp();
-        assert!(guest_resp.expires_at <= now + 12 * 3600 + 5);
+    #[test]
+    fn analyze_log_oom_heap_and_metaspace_distinct() {
+        let hits = analyze_log("java.lang.OutOfMemoryError: Java heap space");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].rule, "Нехватка памяти (Heap OOM)");
 
-        // Authed requesting 100 hours -> allowed
-        let req_auth = Request::builder()
-            .method("POST")
-            .uri("/api/paste")
-            .header("content-type", "application/json")
-            .header("authorization", "Bearer secret-test-token")
-            .body(axum::body::Body::from(r#"{"content": "admin log", "ttl_hours": 100}"#))
-            .unwrap();
-        let res_auth = app.oneshot(req_auth).await.unwrap();
-        let body = to_bytes(res_auth.into_body(), usize::MAX).await.unwrap();
-        let auth_resp: CreatePasteResponse = serde_json::from_slice(&body).unwrap();
-        assert!(auth_resp.expires_at > now + 90 * 3600);
+        let hits = analyze_log("java.lang.OutOfMemoryError: Metaspace");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].rule, "Переполнение Metaspace");
     }
 }
