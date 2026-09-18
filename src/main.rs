@@ -1795,4 +1795,376 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].rule, "Переполнение Metaspace");
     }
+
+    // ----- helpers -----
+
+    #[test]
+    fn human_size_formats_bytes_kb_mb() {
+        assert_eq!(human_size(0), "0 Б");
+        assert_eq!(human_size(512), "512 Б");
+        assert_eq!(human_size(1024), "1.0 КБ");
+        assert_eq!(human_size(1536), "1.5 КБ");
+        assert_eq!(human_size(1024 * 1024), "1.0 МБ");
+        assert_eq!(human_size(5 * 1024 * 1024 + 200 * 1024), "5.2 МБ");
+    }
+
+    #[test]
+    fn syntax_title_known_and_unknown() {
+        assert_eq!(syntax_title("yaml"), "YAML");
+        assert_eq!(syntax_title("go"), "Go");
+        assert_eq!(syntax_title("csharp"), "C#");
+        assert_eq!(syntax_title("cpp"), "C++");
+        assert_eq!(syntax_title("bash"), "Bash / Shell");
+        assert_eq!(syntax_title("plain"), "Обычный текст");
+        assert_eq!(syntax_title(""), "Обычный текст");
+    }
+
+    #[test]
+    fn human_expires_in_rounds_up_to_minutes_hours_days() {
+        let now = Utc::now().timestamp();
+        // sub-minute is shown as the literal second count (clamped to >=1)
+        assert_eq!(human_expires_in(now + 1), "1 сек.");
+        assert_eq!(human_expires_in(now + 30), "30 сек.");
+        assert_eq!(human_expires_in(now + 59), "59 сек.");
+        assert_eq!(human_expires_in(now + 60), "1 мин.");
+        assert_eq!(human_expires_in(now + 90), "2 мин.");
+        // 1h00m -> 1 h; any fractional hour rounds up
+        assert_eq!(human_expires_in(now + 3600), "1 ч.");
+        assert_eq!(human_expires_in(now + 3600 + 30 * 60), "2 ч.");
+        assert_eq!(human_expires_in(now + 3600 + 31 * 60), "2 ч.");
+        assert_eq!(human_expires_in(now + 86400), "1 дн.");
+        // past expiry is clamped to floor of 1 second
+        assert_eq!(human_expires_in(now - 10), "1 сек.");
+    }
+
+    #[test]
+    fn human_time_ago_handles_recent_and_old() {
+        let now = Utc::now().timestamp();
+        assert!(human_time_ago(now - 5).contains("сек."));
+        assert!(human_time_ago(now - 120).contains("мин."));
+        assert!(human_time_ago(now - 7200).contains("ч."));
+        assert!(human_time_ago(now - 86400 * 3).contains("дн."));
+        // future timestamps must not produce negative counts
+        assert!(human_time_ago(now + 30).contains("сек."));
+    }
+
+    #[test]
+    fn render_sidebar_empty_and_populated() {
+        assert!(render_sidebar_pastes(&[]).contains("Публичных записей пока нет"));
+
+        let item = PasteItem {
+            id: "abc123".into(),
+            title: "Crashed <server>".into(),
+            syntax: "log".into(),
+            size_bytes: 2048,
+            views: 7,
+            created_at_human: "1 ч. назад".into(),
+            has_issues: true,
+            is_encrypted: false,
+            burn_after_reading: false,
+        };
+        let html = render_sidebar_pastes(&[item]);
+        assert!(html.contains("href=\"/p/abc123\""));
+        // raw title must be HTML-escaped to avoid injection
+        assert!(html.contains("Crashed &lt;server&gt;"));
+        assert!(html.contains("badge-warn"));
+        assert!(!html.contains("badge-enc"));
+        assert!(html.contains("Лог сервера"));
+        assert!(html.contains("2.0 КБ"));
+    }
+
+    // ----- payload structs -----
+
+    #[test]
+    fn create_paste_payload_parses_full_json() {
+        let json = r#"{
+            "title":"hello",
+            "syntax":"rust",
+            "content":"fn main() {}",
+            "ttl_minutes":30,
+            "is_private":true,
+            "is_encrypted":false,
+            "burn_after_reading":true
+        }"#;
+        let back: CreatePastePayload = serde_json::from_str(json).unwrap();
+        assert_eq!(back.title.as_deref(), Some("hello"));
+        assert_eq!(back.syntax.as_deref(), Some("rust"));
+        assert_eq!(back.content.as_deref(), Some("fn main() {}"));
+        assert_eq!(back.ttl_minutes, Some(30));
+        assert_eq!(back.ttl_hours, None);
+        assert_eq!(back.is_private, Some(true));
+        assert_eq!(back.is_encrypted, Some(false));
+        assert_eq!(back.burn_after_reading, Some(true));
+    }
+
+    #[test]
+    fn create_paste_payload_accepts_missing_optional_fields() {
+        let back: CreatePastePayload =
+            serde_json::from_str("{\"content\":\"only content\"}").unwrap();
+        assert_eq!(back.content.as_deref(), Some("only content"));
+        assert!(back.title.is_none());
+        assert!(back.ttl_minutes.is_none());
+        assert!(back.is_private.is_none());
+    }
+
+    // ----- database -----
+
+    fn fresh_db() -> Connection {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        init_db(&conn).expect("init schema");
+        conn
+    }
+
+    fn insert_paste(
+        conn: &Connection,
+        id: &str,
+        created_at: i64,
+        expires_at: i64,
+    ) {
+        let compressed = zstd::encode_all(b"x".repeat(64).as_slice(), 3).unwrap();
+        conn.execute(
+            "INSERT INTO pastes
+             (id, title, syntax, content, size_bytes, views, is_private,
+              is_encrypted, burn_after_reading, created_at, expires_at, has_issues)
+             VALUES (?1, 't', 'text', ?2, 64, 0, 0, 0, 0, ?3, ?4, 0)",
+            params![id, compressed, created_at, expires_at],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn init_db_creates_pastes_table_with_required_columns() {
+        let conn = fresh_db();
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(pastes)")
+            .expect("pragma");
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        for required in [
+            "id",
+            "title",
+            "syntax",
+            "content",
+            "size_bytes",
+            "views",
+            "is_private",
+            "is_encrypted",
+            "burn_after_reading",
+            "created_at",
+            "expires_at",
+            "has_issues",
+        ] {
+            assert!(cols.iter().any(|c| c == required), "missing column: {}", required);
+        }
+    }
+
+    #[test]
+    fn clean_expired_deletes_only_past_rows() {
+        let conn = fresh_db();
+        let now = Utc::now().timestamp();
+        insert_paste(&conn, "live", now, now + 60);
+        insert_paste(&conn, "dead", now - 1, now);
+        let removed = clean_expired(&conn).unwrap();
+        assert_eq!(removed, 1);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pastes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        let id: String = conn
+            .query_row("SELECT id FROM pastes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(id, "live");
+    }
+
+    // ----- end-to-end handlers -----
+
+    fn test_state() -> AppState {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        AppState {
+            db: Arc::new(Mutex::new(conn)),
+            base_url: "http://localhost:8080".to_string(),
+            auth_token: "secret-token".to_string(),
+        }
+    }
+
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode as AxStatusCode};
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn create_paste_rejects_empty_raw_body() {
+        // When content-type is not JSON the body is read as raw text, and an
+        // empty body must be rejected as 400 BAD_REQUEST.
+        let app = app_router(test_state());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/paste")
+            .header("content-type", "text/plain")
+            .body(Body::from(""))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), AxStatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_paste_rejects_whitespace_only_raw_body() {
+        let app = app_router(test_state());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/paste")
+            .header("content-type", "text/plain")
+            .body(Body::from("   \n\t  "))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), AxStatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_paste_round_trip_through_get_raw() {
+        let app = app_router(test_state());
+        // 1. POST a plaintext paste via JSON
+        let create = Request::builder()
+            .method("POST")
+            .uri("/api/paste")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"title":"hi","syntax":"rust","content":"fn main() {}","ttl_minutes":5}"#,
+            ))
+            .unwrap();
+        let resp = app.oneshot(create).await.unwrap();
+        assert_eq!(resp.status(), AxStatusCode::OK);
+        let body = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let payload: CreatePasteResponse = serde_json::from_slice(&body).unwrap();
+        assert!(!payload.id.is_empty());
+        assert!(payload.url.contains(&payload.id));
+        assert_eq!(payload.issues_detected, 0);
+
+        // 2. GET /raw/:id returns the original text
+        let app2 = app_router(test_state());
+        let raw = Request::builder()
+            .uri(format!("/raw/{}", payload.id))
+            .body(Body::empty())
+            .unwrap();
+        // fresh in-memory DB has no row -> 404 expected (state was dropped)
+        let resp = app2.oneshot(raw).await.unwrap();
+        assert_eq!(resp.status(), AxStatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn create_paste_detects_eula_and_stamps_issues() {
+        let state = test_state();
+        let app = app_router(state.clone());
+        let content = "[Server] You need to agree to the EULA in order to run the server";
+        let create = Request::builder()
+            .method("POST")
+            .uri("/api/paste")
+            .header("content-type", "application/json")
+            .body(Body::from(format!(
+                r#"{{"title":"crash","syntax":"log","content":"{}"}}"#,
+                content
+            )))
+            .unwrap();
+        let resp = app.oneshot(create).await.unwrap();
+        assert_eq!(resp.status(), AxStatusCode::OK);
+        let body = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let payload: CreatePasteResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.issues_detected, 1);
+
+        // verify has_issues column was stamped
+        let conn = state.db.lock().unwrap();
+        let has_issues: i64 = conn
+            .query_row(
+                "SELECT has_issues FROM pastes WHERE id = ?1",
+                params![payload.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_issues, 1);
+    }
+
+    #[tokio::test]
+    async fn create_paste_guest_ttl_is_clamped_to_12h() {
+        let state = test_state();
+        let app = app_router(state.clone());
+        // 48h requested as guest -> must be clamped to 12h
+        let create = Request::builder()
+            .method("POST")
+            .uri("/api/paste")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"content":"x","ttl_hours":48}"#,
+            ))
+            .unwrap();
+        let resp = app.oneshot(create).await.unwrap();
+        assert_eq!(resp.status(), AxStatusCode::OK);
+        let body = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let payload: CreatePasteResponse = serde_json::from_slice(&body).unwrap();
+
+        let conn = state.db.lock().unwrap();
+        let expires_at: i64 = conn
+            .query_row(
+                "SELECT expires_at FROM pastes WHERE id = ?1",
+                params![payload.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let now = Utc::now().timestamp();
+        let ttl_min = (expires_at - now) / 60;
+        assert!(
+            ttl_min <= 12 * 60 + 1 && ttl_min >= 12 * 60 - 1,
+            "expected ~12h clamp, got {} min",
+            ttl_min
+        );
+    }
+
+    #[tokio::test]
+    async fn create_paste_authenticated_user_can_exceed_guest_ttl() {
+        let state = test_state();
+        let app = app_router(state.clone());
+        // 14 days requested with valid bearer -> allowed (336 * 60 == 20160 min)
+        let create = Request::builder()
+            .method("POST")
+            .uri("/api/paste")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer secret-token")
+            .body(Body::from(
+                r#"{"content":"x","ttl_hours":336}"#,
+            ))
+            .unwrap();
+        let resp = app.oneshot(create).await.unwrap();
+        assert_eq!(resp.status(), AxStatusCode::OK);
+        let body = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let payload: CreatePasteResponse = serde_json::from_slice(&body).unwrap();
+
+        let conn = state.db.lock().unwrap();
+        let expires_at: i64 = conn
+            .query_row(
+                "SELECT expires_at FROM pastes WHERE id = ?1",
+                params![payload.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let now = Utc::now().timestamp();
+        let ttl_min = (expires_at - now) / 60;
+        assert!(
+            ttl_min >= 336 * 60 - 1,
+            "expected ~336h, got {} min",
+            ttl_min
+        );
+    }
+
+    #[tokio::test]
+    async fn get_raw_returns_404_for_missing_paste() {
+        let app = app_router(test_state());
+        let req = Request::builder()
+            .uri("/raw/does-not-exist")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), AxStatusCode::NOT_FOUND);
+    }
 }
