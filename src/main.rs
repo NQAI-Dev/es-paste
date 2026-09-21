@@ -813,9 +813,9 @@ pub async fn public_archive(
 
         if search_term.is_empty() {
             let mut stmt = conn.prepare(
-                "SELECT id, title, syntax, size_bytes, views, created_at, has_issues 
+                "SELECT id, title, syntax, size_bytes, views, created_at, has_issues, is_encrypted, burn_after_reading 
                  FROM pastes 
-                 WHERE is_private = 0 AND expires_at > ?1 
+                 WHERE is_private = 0 AND burn_after_reading = 0 AND expires_at > ?1 
                  ORDER BY created_at DESC 
                  LIMIT 50"
             ).unwrap();
@@ -841,9 +841,9 @@ pub async fn public_archive(
         } else {
             let pattern = format!("%{}%", search_term);
             let mut stmt = conn.prepare(
-                "SELECT id, title, syntax, size_bytes, views, created_at, has_issues 
+                "SELECT id, title, syntax, size_bytes, views, created_at, has_issues, is_encrypted, burn_after_reading 
                  FROM pastes 
-                 WHERE is_private = 0 AND expires_at > ?1 AND title LIKE ?2 
+                 WHERE is_private = 0 AND burn_after_reading = 0 AND expires_at > ?1 AND title LIKE ?2 
                  ORDER BY created_at DESC 
                  LIMIT 50"
             ).unwrap();
@@ -2166,5 +2166,73 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), AxStatusCode::NOT_FOUND);
+    }
+
+    fn insert_archive_paste(
+        conn: &Connection,
+        id: &str,
+        title: &str,
+        is_private: i64,
+        burn: i64,
+        expires_at: i64,
+    ) {
+        let compressed = zstd::encode_all(b"y".repeat(64).as_slice(), 3).unwrap();
+        let now = Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO pastes
+             (id, title, syntax, content, size_bytes, views, is_private,
+              is_encrypted, burn_after_reading, created_at, expires_at, has_issues)
+             VALUES (?1, ?2, 'text', ?3, 64, 0, ?4, 0, ?5, ?6, ?7, 0)",
+            params![id, title, compressed, is_private, burn, now, expires_at],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn archive_lists_public_pastes_and_excludes_private_expired_burn() {
+        // Regression: the SELECT used to fetch only 7 columns while the row
+        // mapper read columns 7/8 (is_encrypted, burn_after_reading), so every
+        // row failed to map and the archive rendered empty.
+        let state = test_state();
+        let now = Utc::now().timestamp();
+        {
+            let conn = state.db.lock().unwrap();
+            insert_archive_paste(&conn, "pub1", "public log", 0, 0, now + 3600);
+            insert_archive_paste(&conn, "priv1", "secret log", 1, 0, now + 3600);
+            insert_archive_paste(&conn, "gone1", "expired log", 0, 0, now - 10);
+            insert_archive_paste(&conn, "burn1", "burn log", 0, 1, now + 3600);
+        }
+        let app = app_router(state);
+        let req = Request::builder().uri("/archive").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), AxStatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("/p/pub1"), "public paste must be listed");
+        assert!(!html.contains("/p/priv1"), "private paste must be hidden");
+        assert!(!html.contains("/p/gone1"), "expired paste must be hidden");
+        assert!(!html.contains("/p/burn1"), "burn-after-reading paste must be hidden");
+    }
+
+    #[tokio::test]
+    async fn archive_search_filters_by_title() {
+        let state = test_state();
+        let now = Utc::now().timestamp();
+        {
+            let conn = state.db.lock().unwrap();
+            insert_archive_paste(&conn, "match1", "crash report alpha", 0, 0, now + 3600);
+            insert_archive_paste(&conn, "match2", "other note", 0, 0, now + 3600);
+        }
+        let app = app_router(state);
+        let req = Request::builder()
+            .uri("/archive?search=crash")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), AxStatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("/p/match1"), "matching paste must be listed");
+        assert!(!html.contains("/p/match2"), "non-matching paste must be hidden");
     }
 }
