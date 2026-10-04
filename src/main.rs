@@ -2222,6 +2222,8 @@ mod tests {
             let conn = state.db.lock().unwrap();
             insert_archive_paste(&conn, "match1", "crash report alpha", 0, 0, now + 3600);
             insert_archive_paste(&conn, "match2", "other note", 0, 0, now + 3600);
+            insert_archive_paste(&conn, "private-match", "crash private", 1, 0, now + 3600);
+            insert_archive_paste(&conn, "burn-match", "crash one-time", 0, 1, now + 3600);
         }
         let app = app_router(state);
         let req = Request::builder()
@@ -2234,5 +2236,13 @@ mod tests {
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(html.contains("/p/match1"), "matching paste must be listed");
         assert!(!html.contains("/p/match2"), "non-matching paste must be hidden");
+        assert!(
+            !html.contains("/p/private-match"),
+            "private paste must be hidden from search"
+        );
+        assert!(
+            !html.contains("/p/burn-match"),
+            "burn-after-reading paste must be hidden from search"
+        );
     }
 }
