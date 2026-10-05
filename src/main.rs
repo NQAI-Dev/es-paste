@@ -1143,7 +1143,9 @@ pub async fn create_paste(
             if let Some(b) = payload.burn_after_reading {
                 burn_after_reading = b;
             }
-            requested_ttl_minutes = payload.ttl_minutes.or_else(|| payload.ttl_hours.map(|h| h * 60));
+            requested_ttl_minutes = payload
+                .ttl_minutes
+                .or_else(|| payload.ttl_hours.map(|h| h.saturating_mul(60)));
         }
     }
 
@@ -2121,6 +2123,40 @@ mod tests {
         assert!(
             ttl_min <= 12 * 60 + 1 && ttl_min >= 12 * 60 - 1,
             "expected ~12h clamp, got {} min",
+            ttl_min
+        );
+    }
+
+    #[tokio::test]
+    async fn create_paste_extreme_ttl_hours_is_clamped_without_overflow() {
+        let state = test_state();
+        let app = app_router(state.clone());
+        let create = Request::builder()
+            .method("POST")
+            .uri("/api/paste")
+            .header("content-type", "application/json")
+            .body(Body::from(format!(
+                r#"{{"content":"x","ttl_hours":{}}}"#,
+                i64::MAX
+            )))
+            .unwrap();
+        let resp = app.oneshot(create).await.unwrap();
+        assert_eq!(resp.status(), AxStatusCode::OK);
+        let body = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let payload: CreatePasteResponse = serde_json::from_slice(&body).unwrap();
+
+        let conn = state.db.lock().unwrap();
+        let expires_at: i64 = conn
+            .query_row(
+                "SELECT expires_at FROM pastes WHERE id = ?1",
+                params![payload.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let ttl_min = (expires_at - Utc::now().timestamp()) / 60;
+        assert!(
+            ttl_min <= 12 * 60 + 1 && ttl_min >= 12 * 60 - 1,
+            "expected extreme request to clamp to ~12h, got {} min",
             ttl_min
         );
     }
