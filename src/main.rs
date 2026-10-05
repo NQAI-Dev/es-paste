@@ -839,11 +839,15 @@ pub async fn public_archive(
                 items.push(r);
             }
         } else {
-            let pattern = format!("%{}%", search_term);
+            let escaped_term = search_term
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            let pattern = format!("%{}%", escaped_term);
             let mut stmt = conn.prepare(
                 "SELECT id, title, syntax, size_bytes, views, created_at, has_issues, is_encrypted, burn_after_reading 
                  FROM pastes 
-                 WHERE is_private = 0 AND burn_after_reading = 0 AND expires_at > ?1 AND title LIKE ?2 
+                 WHERE is_private = 0 AND burn_after_reading = 0 AND expires_at > ?1 AND title LIKE ?2 ESCAPE '\\'
                  ORDER BY created_at DESC 
                  LIMIT 50"
             ).unwrap();
@@ -2244,5 +2248,49 @@ mod tests {
             !html.contains("/p/burn-match"),
             "burn-after-reading paste must be hidden from search"
         );
+    }
+
+    #[tokio::test]
+    async fn archive_search_treats_like_wildcards_literally() {
+        let state = test_state();
+        let now = Utc::now().timestamp();
+        {
+            let conn = state.db.lock().unwrap();
+            insert_archive_paste(&conn, "percent", "100% complete", 0, 0, now + 3600);
+            insert_archive_paste(&conn, "underscore", "100x complete", 0, 0, now + 3600);
+        }
+        let app = app_router(state);
+        let req = Request::builder()
+            .uri("/archive?search=%25")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), AxStatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("/p/percent"), "literal percent title must match");
+        assert!(!html.contains("/p/underscore"), "wildcard match must not leak in");
+    }
+
+    #[tokio::test]
+    async fn archive_search_treats_underscore_literally() {
+        let state = test_state();
+        let now = Utc::now().timestamp();
+        {
+            let conn = state.db.lock().unwrap();
+            insert_archive_paste(&conn, "literal", "build_42", 0, 0, now + 3600);
+            insert_archive_paste(&conn, "wildcard", "buildX42", 0, 0, now + 3600);
+        }
+        let app = app_router(state);
+        let req = Request::builder()
+            .uri("/archive?search=_")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), AxStatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("/p/literal"), "literal underscore title must match");
+        assert!(!html.contains("/p/wildcard"), "wildcard match must not leak in");
     }
 }
